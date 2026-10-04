@@ -8,4 +8,4 @@ Release/
 *.ilk
 *.tlog
 *.idb
-*.recipe
+*.recipe*.bundle
