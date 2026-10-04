@@ -1,12 +1,21 @@
 /*
-	Reliability and Flow Control Example
-	From "Networking for Game Programmers" - http://www.gaffer.org/networking-for-game-programmers
-	Author: Glenn Fiedler <gaffer@gaffer.org>
-*/
+ * FILE          : ReliableUDP.cpp
+ * PROJECT       : Assignment 1
+ * PROGRAMMER    : Aliaksandr Kazeika , Halvin Silva Mayes
+ * DESCRIPTION   :
+ * program that transfers files over UDP using a custom
+   acknowledgement-based protocol, verifies them with a whole-file
+   CRC32 check, and reports transfer time and speed in Mbps.
+ */
+ /* Reliability and Flow Control Example
+From "Networking for Game Programmers" - http://www.gaffer.org/networking-for-game-programmers
+Author: Glenn Fiedler gaffer@gaffer.org
+                                 */
 #include <iostream>
 #include <fstream>
 #include <string>
 #include <vector>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 
@@ -19,9 +28,10 @@ const int ServerPort = 30000;
 const int ClientPort = 30001;
 const int ProtocolId = 0x11223344;
 const float TimeOut = 10.0f;
-
+//max file bytes per DATA packet
 const int ChunkDataSize = 200;
 
+//our file-transfer packet types (sent on top of ReliableConnection)
 enum PacketType : unsigned char
 {
 	PT_INFO = 1,
@@ -31,6 +41,7 @@ enum PacketType : unsigned char
 	PT_DONE_ACK = 5
 };
 
+//CRC32 lookup table (standard polynomial 0xEDB88320)
 unsigned int crc32_table[256];
 
 void BuildCrc32Table()
@@ -44,6 +55,7 @@ void BuildCrc32Table()
 	}
 }
 
+//calculates CRC32 of the whole buffer
 unsigned int Crc32(const unsigned char* data, size_t length)
 {
 	unsigned int crc = 0xFFFFFFFF;
@@ -52,6 +64,7 @@ unsigned int Crc32(const unsigned char* data, size_t length)
 	return crc ^ 0xFFFFFFFF;
 }
 
+//helpers to write/read integers into byte buffers
 void WriteU32(unsigned char* buf, uint32_t value)
 {
 	buf[0] = (unsigned char)(value >> 24);
@@ -77,6 +90,7 @@ uint16_t ReadU16(const unsigned char* buf)
 	return (uint16_t(buf[0]) << 8) | (uint16_t(buf[1]));
 }
 
+//sends a packet and resends it until the matching ACK arrives
 bool SendReliable(ReliableConnection& connection, unsigned char* packet, int size,
 	unsigned char expectedAckType, uint32_t expectedAckValue)
 {
@@ -88,6 +102,7 @@ bool SendReliable(ReliableConnection& connection, unsigned char* packet, int siz
 	{
 		connection.SendPacket(packet, size);
 
+		//wait for ACK resend on timeout
 		float waited = 0.0f;
 		while (waited < retryTimeout)
 		{
@@ -106,6 +121,7 @@ bool SendReliable(ReliableConnection& connection, unsigned char* packet, int siz
 	return false;
 }
 
+//it sends a small ACK packet 
 void SendAck(ReliableConnection& connection, unsigned char type, uint32_t value)
 {
 	unsigned char ack[5];
@@ -114,7 +130,8 @@ void SendAck(ReliableConnection& connection, unsigned char type, uint32_t value)
 	connection.SendPacket(ack, sizeof(ack));
 }
 
-bool SendFile(ReliableConnection& connection, const string& filePath)
+//client side reads file and sends INFO DATA chunks then DONE
+bool SendFile(ReliableConnection& connection, const string& filePath, bool corruptForTest)
 {
 	ifstream file(filePath, ios::binary | ios::ate);
 	if (!file.is_open())
@@ -126,6 +143,7 @@ bool SendFile(ReliableConnection& connection, const string& filePath)
 	streamsize fileSize = file.tellg();
 	file.seekg(0, ios::beg);
 
+	//load whole file into memory
 	vector<unsigned char> fileData((size_t)fileSize);
 	if (fileSize > 0 && !file.read(reinterpret_cast<char*>(fileData.data()), fileSize))
 	{
@@ -134,8 +152,10 @@ bool SendFile(ReliableConnection& connection, const string& filePath)
 	}
 	file.close();
 
+	//checksum of the original file
 	unsigned int wholeFileCrc = Crc32(fileData.data(), fileData.size());
 
+	//keep only file name no folder path
 	size_t slash = filePath.find_last_of("/\\");
 	string fileName = (slash == string::npos) ? filePath : filePath.substr(slash + 1);
 	if (fileName.size() > 200) fileName = fileName.substr(0, 200);
@@ -143,6 +163,10 @@ bool SendFile(ReliableConnection& connection, const string& filePath)
 	printf("sending file: %s (%zu bytes), crc32 = 0x%08X\n",
 		fileName.c_str(), fileData.size(), wholeFileCrc);
 
+	//start timer
+	auto startTime = chrono::high_resolution_clock::now();
+
+	//Info packet
 	{
 		unsigned char packet[256];
 		int offset = 0;
@@ -165,6 +189,7 @@ bool SendFile(ReliableConnection& connection, const string& filePath)
 	uint32_t totalChunks = (uint32_t)((fileData.size() + ChunkDataSize - 1) / ChunkDataSize);
 	if (totalChunks == 0) totalChunks = 1;
 
+	//Data packets
 	for (uint32_t chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++)
 	{
 		size_t offsetInFile = (size_t)chunkIndex * ChunkDataSize;
@@ -181,6 +206,13 @@ bool SendFile(ReliableConnection& connection, const string& filePath)
 		memcpy(&packet[offset], &fileData[offsetInFile], thisChunkSize);
 		offset += thisChunkSize;
 
+		//corruption test flip one byte in the middle chunk
+		if (corruptForTest && chunkIndex == totalChunks / 2 && thisChunkSize > 0)
+		{
+			printf("*** TEST: corrupting chunk %u on purpose to prove CRC check works ***\n", chunkIndex);
+			packet[offset - 1] ^= 0xFF;
+		}
+
 		if (!SendReliable(connection, packet, offset, PT_ACK, chunkIndex))
 		{
 			printf("receiver stopped responding at chunk %u, aborting\n", chunkIndex);
@@ -191,6 +223,7 @@ bool SendFile(ReliableConnection& connection, const string& filePath)
 			printf("sent chunk %u / %u\n", chunkIndex, totalChunks);
 	}
 
+	//tells receiver the file is complete
 	{
 		unsigned char packet[5];
 		packet[0] = PT_DONE;
@@ -202,11 +235,19 @@ bool SendFile(ReliableConnection& connection, const string& filePath)
 		}
 	}
 
+	//stop timer and calculate speed in Mbps
+	auto endTime = chrono::high_resolution_clock::now();
+	double seconds = chrono::duration<double>(endTime - startTime).count();
+	double megabits = (fileData.size() * 8.0) / 1000000.0;
+
 	printf("\ntransfer complete\n");
+	printf("time taken: %.3f seconds\n", seconds);
+	printf("speed: %.3f Mbps\n", seconds > 0 ? megabits / seconds : 0.0);
 
 	return true;
 }
 
+//server side: receives INFO DATA DONE and checks file integrity
 void ReceiveFiles(ReliableConnection& connection)
 {
 	string outputFileName;
@@ -214,6 +255,7 @@ void ReceiveFiles(ReliableConnection& connection)
 	uint32_t expectedCrc = 0;
 	vector<unsigned char> receivedData;
 	bool receivingFile = false;
+	chrono::high_resolution_clock::time_point startTime;
 
 	printf("waiting for a file...\n");
 
@@ -222,6 +264,7 @@ void ReceiveFiles(ReliableConnection& connection)
 		unsigned char packet[256];
 		int bytes = connection.ReceivePacket(packet, sizeof(packet));
 
+		//if nothing received yet wait a bit
 		if (bytes <= 0)
 		{
 			net::wait(0.01f);
@@ -232,6 +275,7 @@ void ReceiveFiles(ReliableConnection& connection)
 
 		if (type == PT_INFO)
 		{
+			//read file name size and expected crc32
 			int offset = 1;
 			unsigned char nameLen = packet[offset++];
 			outputFileName = "received_" + string(reinterpret_cast<char*>(&packet[offset]), nameLen);
@@ -244,6 +288,8 @@ void ReceiveFiles(ReliableConnection& connection)
 			receivedData.clear();
 			receivedData.resize(expectedFileSize);
 			receivingFile = true;
+			//it starts the timer
+			startTime = chrono::high_resolution_clock::now();
 
 			printf("\nincoming file: %s (%u bytes), expected crc32 = 0x%08X\n",
 				outputFileName.c_str(), expectedFileSize, expectedCrc);
@@ -252,6 +298,7 @@ void ReceiveFiles(ReliableConnection& connection)
 		}
 		else if (type == PT_DATA && receivingFile)
 		{
+			//put chunk into its place in the buffer
 			uint32_t chunkIndex = ReadU32(&packet[1]);
 			uint16_t dataLen = ReadU16(&packet[5]);
 			size_t offsetInFile = (size_t)chunkIndex * ChunkDataSize;
@@ -268,16 +315,26 @@ void ReceiveFiles(ReliableConnection& connection)
 		{
 			uint32_t totalChunks = ReadU32(&packet[1]);
 
+			//stop timer and calculate speed in Mbps
+			auto endTime = chrono::high_resolution_clock::now();
+			double seconds = chrono::duration<double>(endTime - startTime).count();
+			double megabits = (receivedData.size() * 8.0) / 1000000.0;
+
+			//checksum of the received file
 			unsigned int actualCrc = Crc32(receivedData.data(), receivedData.size());
 
+			//save file to disk
 			ofstream out(outputFileName, ios::binary);
 			out.write(reinterpret_cast<char*>(receivedData.data()), receivedData.size());
 			out.close();
 
 			printf("\nfile received: %s\n", outputFileName.c_str());
+			printf("time taken: %.3f seconds\n", seconds);
+			printf("speed: %.3f Mbps\n", seconds > 0 ? megabits / seconds : 0.0);
 			printf("expected crc32: 0x%08X\n", expectedCrc);
 			printf("actual   crc32: 0x%08X\n", actualCrc);
 
+			//compare checksums to detect corruption
 			if (actualCrc == expectedCrc)
 				printf("integrity check passed\n\n");
 			else
@@ -299,8 +356,7 @@ int main(int argc, char* argv[])
 	Mode mode = Server;
 	Address address;
 	string filePath;
-
-	// parse command line
+	bool corruptForTest = false;
 
 	if (argc >= 3)
 	{
@@ -311,10 +367,12 @@ int main(int argc, char* argv[])
 			mode = Client;
 			address = Address(a, b, c, d, ServerPort);
 			filePath = argv[2];
+			if (argc >= 4 && string(argv[3]) == "--corrupt")
+				corruptForTest = true;
 		}
 	}
 
-	// initialize
+	//it initializes
 
 	if (!InitializeSockets())
 	{
@@ -335,13 +393,14 @@ int main(int argc, char* argv[])
 	if (mode == Client)
 	{
 		connection.Connect(address);
-		bool ok = SendFile(connection, filePath);
+		bool ok = SendFile(connection, filePath, corruptForTest);
 		if (!ok)
 			printf("file transfer FAILED\n");
 	}
 	else
 	{
 		connection.Listen();
+		//runs one file after another
 		ReceiveFiles(connection);
 	}
 
